@@ -1,0 +1,132 @@
+
+before_script:
+    - echo "before-script!!"
+    - export COMMIT_TIME=$(git show -s --format=%ct $CI_COMMIT_SHA)
+    - export COMMIT_TIME_BJ=$(date -d@${COMMIT_TIME} '+%Y%m%d%H%M%S')
+variables:
+  DEPLOY_VARIABLE: "default-deploy"  #部署策略
+  GIT_CHECKOUT: "false"
+  #制品库以及仓库代理
+  ARTIFACTORY_URL: "http://192.168.50.132:8081/repository/general-tar-gz"
+  NPM_REGISTRY_URL: "http://192.168.50.132:8081/repository/yarn-public/"
+  #ssh部署主机信息
+  SSH_KNOWN_HOSTS: "192.168.10.87"
+  SSH_KNOWN_PORT: 22
+  SSH_KNOWN_USER: "root"
+
+  #依赖镜像
+  MVN_BUILD_IMAGE: "csanchez/maven:3-openjdk-8"
+  CURL_IMAGE: "curlimages/curl:7.70.0"
+  SSH_IMAGE: "iqimei/alpine:v3.15-ssh-git"
+
+  ## 构建镜像
+  CI_REGISTRY: 'registry.cn-beijing.aliyuncs.com'               #镜像仓库地址              
+  CI_REGISTRY_USER: '502378882@qq.com'                               #仓库用户信息
+  CI_REGISTRY_PASSWD: 'ailiyang123'                              #仓库用户密码
+  IMAGE_NAME: "${CI_REGISTRY}/iqimei/${CI_PROJECT_NAME}:${CI_COMMIT_REF_NAME}-${COMMIT_TIME_BJ}-${CI_COMMIT_SHORT_SHA}"
+
+
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /-deploy$/   #当提交信息以-deploy结尾的时候会进行测试环境部署
+      when: always
+    - if: $CI_COMMIT_MESSAGE =~ /-deployment-prd$/
+      variables:
+        DEPLOY_VARIABLE: "deploy-prd" # 部署到生产环境
+      when: always
+    - when: never
+    
+
+#定义两个阶段 
+stages:
+  - build
+  - image_build
+  - upload_artifacts
+  - deploy
+
+
+
+build-job:
+  variables: 
+    GIT_CHECKOUT: "true"
+  stage: build
+  tags:
+    - rnode1-docker
+  image: ${MVN_BUILD_IMAGE}
+  script:
+    - pwd
+    - ls
+    - mvn clean package  -DskipTests
+    - ls target/*
+    - ls ~/.m2/repository -l
+
+docker_image_build:
+  stage: image_build
+  tags:
+    - rnode1-docker
+  image: iqimei/docker:20.10.8-git
+  script:
+    - echo "${IMAGE_NAME}"
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWD  $CI_REGISTRY
+    # - docker build -t ${IMAGE_NAME} -f ${DOCKER_FILE_PATH} .
+    - docker build -t ${IMAGE_NAME} .
+    - docker push ${IMAGE_NAME} 
+    - docker rmi ${IMAGE_NAME}
+
+upload_dist_artifacts:   
+  stage: upload_artifacts
+  tags:
+    - rnode1-docker
+  image: ${CURL_IMAGE}
+  script:
+    - echo "upload_dist_artifacts"
+    - curl --version
+    - ls target/*
+    # - echo "curl -v -u $NEXUS3_AUTH --upload-file dist-${COMMIT_TIME_BJ}-${CI_COMMIT_SHORT_SHA}.tar.gz ${ARTIFACTORY_URL}/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}/dist-${COMMIT_TIME_BJ}-${CI_COMMIT_SHORT_SHA}.tar.gz"
+    # - cd dist
+    # - ls
+    # - curl -v -u $NEXUS3_AUTH --upload-file dist-${COMMIT_TIME_BJ}-${CI_COMMIT_SHORT_SHA}.tar.gz ${ARTIFACTORY_URL}/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}/dist-${COMMIT_TIME_BJ}-${CI_COMMIT_SHORT_SHA}.tar.gz
+  # rules:
+  #   - if: "$DEPLOY_VARIABLE == 'deploy-prd'"
+  #     when: always
+  #   - when: never
+
+deploy-job:
+  stage: deploy
+  tags:
+    - rnode1-docker
+  image: ${SSH_IMAGE}
+  script:
+    - echo "替換docker-compose文件中的变量"
+    - sed -i -e "s#{IMAGE_TAG}#${IMAGE_NAME}#g" docker-compose.yml
+    - echo "deploy ${SSH_KNOWN_HOSTS}"
+    - echo "starting deploy use ssh copy ......"
+    - eval $(ssh-agent -s)
+    - echo "$TEST_SSH_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan $SSH_KNOWN_HOSTS >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+    - ssh root@$SSH_KNOWN_HOSTS "\[ -d "/app/${CI_PROJECT_NAME}" \] || mkdir -p /app/${CI_PROJECT_NAME}"
+    - scp docker-compose.yml root@$SSH_KNOWN_HOSTS:/app/${CI_PROJECT_NAME}
+    - ssh root@$SSH_KNOWN_HOSTS "cd /app/${CI_PROJECT_NAME} && docker compose up -d"
+  rules:
+    - if: "$DEPLOY_VARIABLE == 'deploy-prd'"
+      when: never
+    - when: always
+
+
+
+# deploy-prd-job:
+#   stage: deploy
+#   tags:
+#     - docker143
+#   image: reg.aixbx.com/pubcomp/node16-alpine-tools:v2
+#   script:
+#     - echo "deploy prod"
+#     - ls dist/*
+#   rules:
+#     - if: "$DEPLOY_VARIABLE == 'deploy-prd'"
+#       when: manual
+#     - when: never
